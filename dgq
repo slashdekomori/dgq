@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# dgq - make Discord show "Playing <game>" by running an idle process at the
+# executable path Discord's detectable-games list expects for that game.
+#
+#   dgq                  ask for a game name, then play it
+#   dgq witcher 3        search, pick if ambiguous, play until Enter / Ctrl-C
+#   dgq -n witcher 3     dry run: show what would be started
+#   dgq -l witcher       list matching games and their executables (-l alone: all)
+#
+# The games list is downloaded fresh on every start (while you type the name),
+# so it is always current and nothing is stored. Needs curl and jq.
+# Env: DGQ_API (Discord API version, default v10)
+
+set -euo pipefail
+
+URL="https://discord.com/api/${DGQ_API:-v10}/applications/detectable"
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/dgq
+RUN_ROOT=${XDG_RUNTIME_DIR:-$CACHE}/dgq-run
+BASE=$RUN_ROOT/$$     # this run: games list + fake exe, removed on exit
+LIST=$BASE/games.tsv
+AWK=$(command -v gawk || command -v awk)
+[[ $(locale charmap 2>/dev/null) == UTF-8 ]] || export LC_ALL=C.UTF-8
+
+if [[ -t 1 ]]; then B=$'\e[1m' D=$'\e[2m' G=$'\e[32m' Y=$'\e[33m' R=$'\e[0m'; else B='' D='' G='' Y='' R=''; fi
+
+die() { printf 'dgq: %s\n' "$*" >&2; exit 1; }
+
+# Discord's JSON -> one TSV line per game: name, id, aliases (joined by \x1f),
+# then os, exe path, arguments repeated per executable. Launchers and macOS
+# entries are dropped: Discord never matches launchers, and macOS exes are
+# useless here.
+JQ_TSV='
+if type != "array" or length == 0 then error("unexpected response from Discord") else .[] end
+| [(.executables // [])[]
+   | select((.is_launcher | not) and (.os == "win32" or .os == "linux") and ((.name // "") != ""))
+   | .os, .name, (.arguments // "")] as $exes
+| select($exes | length > 0)
+| [.name // "", .id // "", ((.aliases // []) | join("\u001f"))] + $exes
+| map(tostring | gsub("[\t\r\n]"; " "))
+| join("\t")'
+
+# Ranks DB lines against `query`: exact name/alias, leading words, whole-word phrase,
+# substring, then all words present. Compares lowercase with punctuation folded
+# to spaces (apostrophes dropped), so "witcher 3 wild hunt" finds
+# "The Witcher 3: Wild Hunt" and "garrys mod" finds "Garry's Mod".
+AWK_SEARCH='
+function norm(s) { s = tolower(s); gsub(/[\047’]/, "", s); gsub(/[^[:alnum:]]+/, " ", s); gsub(/^ +| +$/, "", s); return s }
+function rank(s,   n, i) {
+    n = norm(s)
+    if (n == "") return 99
+    if (n == q) return 0
+    if (index(n " ", q " ") == 1) return 1
+    if (index(" " n " ", " " q " ")) return 2
+    if (index(n, q)) return 3
+    for (i = 1; i <= nt; i++) if (!index(n, tok[i])) return 99
+    return 4
+}
+BEGIN { FS = "\t"; q = norm(query); nt = split(q, tok, " "); by_id = query ~ /^[0-9]+$/ && length(query) >= 15 }
+by_id { if ($2 == query) print 0 "\t0\t" $0; next }
+q == "" { exit }
+{
+    best = rank($1)
+    na = split($3, al, "\037")
+    for (i = 1; i <= na; i++) { r = rank(al[i]); if (r < best) best = r }
+    # an exe file name equal to the query ("cs2" -> win64/cs2.exe) counts as a whole-word hit
+    for (i = 5; i <= NF && best > 2; i += 3) {
+        e = tolower($i); sub(/.*\//, "", e); sub(/^>/, "", e); sub(/\.[^.]*$/, "", e)
+        if (e == q) best = 2
+    }
+    if (best < 99) printf "%d\t%d\t%s\n", best, length($1), $0
+}'
+
+# Idle helper: blocks until killed, and exits on its own if dgq dies (closed
+# terminal, SIGKILL), so Discord never keeps showing a stale game. Unlike
+# `sleep`, it accepts any arguments, which some games need to be detected.
+HELPER_C='
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+int main(void) {
+    const char *parent = getenv("DGQ_PARENT");
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (parent && getppid() != (pid_t)atol(parent)) return 0;
+    for (;;) pause();
+}'
+
+fetch() {
+    curl -fsS --compressed --retry 2 "$URL" | jq -r "$JQ_TSV" | sort -f -t $'\t' -k1,1 >"$LIST"
+}
+
+# Waits for the background download started at launch. Must run in the main
+# shell (not inside $(...)), since only the parent can `wait` for it.
+need_list() {
+    [[ -n ${FETCH_PID:-} ]] || return 0
+    kill -0 "$FETCH_PID" 2>/dev/null && printf '%sloading the games list...%s\n' "$D" "$R" >&2
+    wait "$FETCH_PID" || { FETCH_PID=; die "could not get the games list from $URL"; }
+    FETCH_PID=
+    [[ -s $LIST ]] || die "Discord returned an empty games list"
+}
+
+# Matching list lines, best first, each prefixed with its rank and a tab.
+search_ranked() {
+    "$AWK" -v query="$1" "$AWK_SEARCH" "$LIST" | sort -t $'\t' -k1,1n -k2,2n -k3,3f | cut -f1,3-
+}
+search() { search_ranked "$1" | cut -f2-; }
+
+# Splits a list line into F[] (keeping empty fields, unlike `read -a`).
+fields() { mapfile -t -d $'\t' F < <(printf '%s\t' "$1"); }
+
+print_game() {
+    local i
+    fields "$1"
+    printf '%s%s%s  %s%s%s\n' "$B" "${F[0]}" "$R" "$D" "${F[1]}" "$R"
+    for ((i = 3; i + 2 < ${#F[@]}; i += 3)); do
+        printf '    %-6s %s%s\n' "${F[i]}" "${F[i+1]}" "${F[i+2]:+  $D${F[i+2]}$R}"
+    done
+}
+
+# A relative path with no empty, "." or ".." segments; a leading ">" (Discord's
+# "match the file name exactly" marker) is stripped by the caller.
+safe_path() { [[ -n $1 && $1 != /* && $1 != *\\* && /$1/ != *//* && /$1/ != */./* && /$1/ != */../* ]]; }
+
+# Picks the executable to impersonate: native Linux entries first, then
+# Windows ones (Discord detects those too, as Wine/Proton processes).
+choose_exe() {
+    local os i p
+    fields "$1"
+    for os in linux win32; do
+        for ((i = 3; i + 2 < ${#F[@]}; i += 3)); do
+            [[ ${F[i]} == "$os" ]] || continue
+            p=${F[i+1]#>}
+            safe_path "$p" || continue
+            EXE_PATH=$p EXE_ARGS=${F[i+2]}
+            return 0
+        done
+    done
+    return 1
+}
+
+prepare_helper() {
+    local h=$CACHE/idle-1
+    if [[ ! -x $h ]] && command -v cc >/dev/null; then
+        mkdir -p -- "$CACHE"
+        if cc -O2 -s -o "$h.tmp" -x c - <<<"$HELPER_C" 2>/dev/null; then mv -- "$h.tmp" "$h"; else rm -f -- "$h.tmp"; fi
+    fi
+    if [[ -x $h ]]; then
+        HELPER=$h HELPER_KIND=idle
+    else
+        HELPER=$(command -v sleep) HELPER_KIND=sleep
+    fi
+}
+
+# Removes run dirs left behind by dgq processes that were killed.
+sweep() {
+    local d
+    for d in "$RUN_ROOT"/*/; do
+        [[ -d $d ]] || continue
+        d=${d%/}
+        kill -0 "${d##*/}" 2>/dev/null || rm -rf -- "$d"
+    done
+}
+
+cleanup() {
+    if [[ -n ${FETCH_PID:-} ]]; then kill "$FETCH_PID" 2>/dev/null || true; fi
+    if [[ -n ${PID:-} ]]; then
+        kill "$PID" 2>/dev/null || true
+        wait "$PID" 2>/dev/null || true
+    fi
+    rm -rf -- "$BASE"
+}
+
+play() {
+    local line=$1 name fake
+    local -a argv
+    fields "$line"
+    name=${F[0]}
+    choose_exe "$line" || die "'$name' has no executable dgq can use"
+    prepare_helper
+    fake=$BASE/run/$EXE_PATH
+    if [[ $HELPER_KIND == idle ]]; then
+        read -r -a argv <<<"$EXE_ARGS"
+    else
+        argv=(infinity)
+    fi
+
+    if ((dry_run)); then
+        printf 'game   %s\napp id %s\nexe    %s\n' "$name" "${F[1]}" "$EXE_PATH"
+        [[ -z $EXE_ARGS ]] || printf 'args   %s\n' "$EXE_ARGS"
+        printf 'run    %s%s\nhelper %s (%s)\n' "$fake" "${argv[*]:+ ${argv[*]}}" "$HELPER" "$HELPER_KIND"
+        return
+    fi
+
+    [[ -z $EXE_ARGS || $HELPER_KIND == idle ]] ||
+        echo "${Y}warning:${R} Discord wants arguments '$EXE_ARGS' for this game; install a C compiler so dgq can pass them" >&2
+
+    mkdir -p -- "$(dirname -- "$fake")"
+    cp -- "$HELPER" "$fake"
+    DGQ_PARENT=$$ "$fake" "${argv[@]}" &
+    PID=$!
+    sleep 0.3
+    kill -0 "$PID" 2>/dev/null || die "the helper process exited immediately (is $RUN_ROOT mounted noexec?)"
+
+    printf '%sNow playing:%s %s%s%s\n' "$G" "$R" "$B" "$name" "$R"
+    printf '%sas %s (pid %s). Discord picks it up within ~15 s.%s\n' "$D" "$EXE_PATH" "$PID" "$R"
+    if [[ -t 0 ]]; then
+        printf '%sPress Enter or Ctrl-C to stop.%s\n' "$D" "$R"
+        read -r || true
+    else
+        wait "$PID" || true
+    fi
+}
+
+# Resolves a query to one list line on stdout; ambiguity is settled by asking.
+pick() {
+    local query=$1 n choice
+    local -a hits
+    mapfile -t hits < <(search_ranked "$query")
+    n=${#hits[@]}
+    ((n)) || { echo "${Y}No game matching '$query'.${R} Try a shorter part of the name." >&2; return 1; }
+    # a single exact (name or alias) match wins outright
+    if ((n == 1)) || [[ ${hits[0]%%$'\t'*} == 0 && ${hits[1]%%$'\t'*} != 0 ]]; then
+        printf '%s\n' "${hits[0]#*$'\t'}"
+        return
+    fi
+    hits=("${hits[@]#*$'\t'}")
+    local max=$((n < 20 ? n : 20)) i
+    for ((i = 0; i < max; i++)); do
+        printf '  %2d) %s\n' $((i + 1)) "${hits[i]%%$'\t'*}" >&2
+    done
+    ((n <= max)) || echo "  ${D}... and $((n - max)) more - refine the search${R}" >&2
+    [[ -t 0 ]] || { echo "dgq: '$query' is ambiguous" >&2; return 1; }
+    read -r -p "Pick 1-$max (Enter to cancel): " choice || return 1
+    [[ -n $choice ]] || return 1
+    [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= max)) || { echo "Not a valid choice." >&2; return 1; }
+    printf '%s\n' "${hits[choice - 1]}"
+}
+
+list_only=0 dry_run=0
+while getopts ":lnh" opt; do
+    case $opt in
+        l) list_only=1 ;;
+        n) dry_run=1 ;;
+        h) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "dgq: unknown option -$OPTARG (try -h)" >&2; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+query="$*"
+
+command -v curl >/dev/null || die "needs curl"
+command -v jq >/dev/null || die "needs jq"
+[[ -n $query || -t 0 || $list_only == 1 ]] || die "usage: dgq [-n] <game name>   (dgq -h for more)"
+
+mkdir -p -- "$RUN_ROOT"
+sweep
+mkdir -p -- "$BASE"
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+fetch &
+FETCH_PID=$!
+
+if ((list_only)); then
+    need_list
+    if [[ -z $query ]]; then
+        while IFS= read -r line; do print_game "$line"; done <"$LIST"
+    else
+        found=0
+        while IFS= read -r line; do print_game "$line"; found=1; done < <(search "$query")
+        ((found)) || die "no game matching '$query'"
+    fi
+    exit 0
+fi
+
+if [[ -n $query ]]; then
+    need_list
+    line=$(pick "$query") || exit 1
+else
+    while :; do
+        read -r -p 'Game: ' query || exit 0
+        [[ -n ${query// /} ]] || exit 0
+        need_list
+        line=$(pick "$query") && break
+    done
+fi
+play "$line"
