@@ -6,6 +6,13 @@ dgq looks up the game in Discord's list of detectable games. Then it starts a sm
 
 Nothing is installed and no game files are downloaded. The games list is fetched fresh from Discord on every run, so new quest games work right away.
 
+## Download
+
+Get the latest version from the [Releases page](https://github.com/slashdekomori/dgq/releases/latest):
+
+- **Windows**: `dgq-win.zip`
+- **Linux**: `dgq` (run `chmod +x dgq` after downloading)
+
 ## Help
 
 **Linux** (needs `curl` and `jq`; a C compiler is optional but recommended):
@@ -18,6 +25,6 @@ Nothing is installed and no game files are downloaded. The games list is fetched
 ./dgq -h               # help
 ```
 
-**Windows**: unzip `dgq-win.zip` (build it with `./build-win.sh`), double-click `Play.bat`, and type the game name. `Play.bat /check <name>` and `Play.bat /list <name>` work the same way as `-n` and `-l`. More details are in `win/README.txt`.
+**Windows**: unzip `dgq-win.zip`, double-click `Play.bat`, and type the game name. `Play.bat /check <name>` and `Play.bat /list <name>` work the same way as `-n` and `-l`. More details are in `win/README.txt`.
 
 **If it doesn't show up**: make sure Discord's Activity Privacy setting shares your detected activity, and give it about 15 seconds.
